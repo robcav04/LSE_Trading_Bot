@@ -1,0 +1,9 @@
+# requirements.txt
+ibapi
+pandas
+torch
+scikit-learn
+pyyaml
+pandas_market_calendars
+tables # For HDF5 support
+tqdm
