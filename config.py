@@ -70,4 +70,3 @@ INDICATORS = [
     {"method": "roc", "params": {"length": 12}, "output_cols": ["ROC_12"]},
     {"method": "willr", "params": {"length": 14}, "output_cols": ["WILLR_14"]},
 ]
-
