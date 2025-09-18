@@ -17,7 +17,8 @@ from ibapi.client import EClient
 from ibapi.wrapper import EWrapper
 from ibapi.contract import Contract
 from ibapi.order import Order
-from ibapi.common import TickerId
+from ibapi.common import TickerId, BarData
+from ibapi.contract import ContractDetails
 
 import config
 from utils import setup_logging, get_lse_calendar, get_market_schedule_for_date
@@ -139,7 +140,8 @@ class IBApp(EWrapper, EClient):
         EClient.__init__(self, self)
         if not isinstance(tickers, list) or not tickers:
             raise ValueError("IBApp requires a non-empty list of tickers.")
-        self.tickers = tickers
+        self.all_tickers = tickers
+        self.tradable_tickers: List[str] = []
         self.logger = logging.getLogger("TradingBot")
 
         # --- State Management ---
@@ -158,12 +160,13 @@ class IBApp(EWrapper, EClient):
 
         # --- Live Data Collection ---
         self.open_prices: Dict[str, float] = {}
-        self.open_price_req_ids = {i + 1: ticker for i, ticker in enumerate(tickers)}
-        self.open_price_ticker_map = {v: k for k, v in self.open_price_req_ids.items()}
+        self.open_price_req_ids: Dict[int, str] = {}
+        self.open_price_ticker_map: Dict[str, int] = {}
 
         # --- Asynchronous Request Management ---
-        self.historical_data_queue = queue.Queue()
+        self.historical_data_queue: queue.Queue = queue.Queue()
         self.active_requests: Dict[int, threading.Event] = {}
+        self.active_contract_requests: Dict[int, dict] = {}
 
         # --- Threading Events for Synchronization ---
         self.connection_event = threading.Event()
@@ -171,19 +174,32 @@ class IBApp(EWrapper, EClient):
         self.position_end_event = threading.Event()
         self.open_order_end_event = threading.Event()
         self.account_summary_event = threading.Event()
-        self.historical_data_end_event = threading.Event()
 
     # --- EWrapper Callbacks (Handles incoming messages from IB) ---
     def error(self, reqId: TickerId, errorCode: int, errorString: str, advancedOrderRejectJson: str = "", errorTime: int = 0):
         """Catches errors from the API."""
+        # Informational messages
         if errorCode in [162, 2104, 2106, 2107, 2158, 2176]:
-            print(f"INFO (ReqId: {reqId}): {errorString}")
+            self.logger.info(f"INFO (ReqId: {reqId}): {errorString}")
+            if reqId in self.active_contract_requests:
+                self.active_contract_requests[reqId]['event'].set() # Let valid info messages also unblock
             return
 
-        print(f"ERROR - ReqId: {reqId}, Code: {errorCode}, Msg: {errorString}")
+        self.logger.error(f"ERROR - ReqId: {reqId}, Code: {errorCode}, Msg: {errorString}")
         
-        if reqId != -1 and self.data_received_event:
-            self.data_received_event.set()
+        # Handle failed contract detail requests
+        if reqId in self.active_contract_requests:
+            ticker = self.active_contract_requests[reqId]['ticker']
+            if errorCode == 200: # "No security definition has been found for the request"
+                self.logger.warning(f"Could not find contract for {ticker}. It will be excluded.")
+            else:
+                 self.logger.error(f"API error for {ticker} contract details.")
+            self.active_contract_requests[reqId]['event'].set()
+        
+        # Handle historical data request timeouts or failures
+        if reqId in self.active_requests:
+            self.active_requests[reqId].set()
+
 
     def nextValidId(self, orderId: int):
         super().nextValidId(orderId)
@@ -197,7 +213,7 @@ class IBApp(EWrapper, EClient):
 
     def connectionClosed(self):
         self.logger.error("Connection closed.")
-        self.connection_event.set()
+        self.connection_event.clear() # Clear event on close
 
     def position(self, account: str, contract: Contract, position: float, avgCost: float):
         if position != 0:
@@ -235,7 +251,7 @@ class IBApp(EWrapper, EClient):
         if tag == "NetLiquidation":
             try:
                 self.net_liquidation_value = float(value)
-            except Exception:
+            except (ValueError, TypeError):
                 self.logger.error(f"Failed to parse NetLiquidation value '{value}'")
                 self.net_liquidation_value = 0.0
             self.account_summary_event.set()
@@ -244,14 +260,16 @@ class IBApp(EWrapper, EClient):
         self.cancelAccountSummary(reqId)
 
     def tickPrice(self, reqId: TickerId, tickType: int, price: float, attrib):
-        if tickType == 14 and reqId in self.open_price_req_ids:  # 14 = Open Tick
+        # Tick type 14 is 'OPEN_TICK', often the official open but can be delayed.
+        # Tick type 68 is 'DELAYED_OPEN', a reliable fallback.
+        if tickType in [14, 68] and reqId in self.open_price_req_ids:
             ticker = self.open_price_req_ids[reqId]
             if ticker not in self.open_prices and _is_finite_positive(price):
                 self.open_prices[ticker] = price
                 self.logger.info(f"Received opening price for {ticker}: {price}")
                 self.cancelMktData(reqId)
 
-    def historicalData(self, reqId: int, bar):
+    def historicalData(self, reqId: int, bar: BarData):
         data = {
             "Date": bar.date, "Open": bar.open, "High": bar.high,
             "Low": bar.low, "Close": bar.close, "Volume": bar.volume,
@@ -262,6 +280,22 @@ class IBApp(EWrapper, EClient):
         if reqId in self.active_requests:
             self.active_requests[reqId].set()
             self.logger.info(f"Historical data end for ReqId: {reqId}")
+
+    def contractDetails(self, reqId: int, contractDetails: ContractDetails):
+        """Receives contract details and confirms a ticker is valid."""
+        if reqId in self.active_contract_requests:
+            ticker = self.active_contract_requests[reqId]['ticker']
+            self.logger.info(f"Successfully verified contract for {ticker}.")
+            self.tradable_tickers.append(ticker)
+            self.active_contract_requests[reqId]['event'].set()
+    
+    def contractDetailsEnd(self, reqId: int):
+        """Signals the end of a contract details request."""
+        if reqId in self.active_contract_requests:
+            # If we get an end message but no details, it means no contract was found.
+            # The error callback usually handles this, but this is a good fallback.
+            self.active_contract_requests[reqId]['event'].set()
+
 
     # --- Core Bot Methods ---
 
@@ -280,10 +314,7 @@ class IBApp(EWrapper, EClient):
         order.action = action
         order.totalQuantity = quantity
         order.orderType = order_type
-        if order_type == "MOC":
-            order.tif = "GTC"
-        else:
-            order.tif = "DAY"
+        order.tif = "GTC" if order_type == "MOC" else "DAY"
         return order
 
     def connect_and_start(self):
@@ -310,13 +341,13 @@ class IBApp(EWrapper, EClient):
         self.position_end_event.clear()
         self.reqPositions()
         if not self.position_end_event.wait(10):
-            raise TimeoutError("Timeout waiting for position data.")
-        self.logger.info(f"Current positions: {list(self.current_positions.keys())}")
+            self.logger.warning("Timeout waiting for position data.")
+        self.logger.info(f"Found {len(self.current_positions)} positions: {list(self.current_positions.keys())}")
 
         self.open_order_end_event.clear()
         self.reqAllOpenOrders()
         if not self.open_order_end_event.wait(10):
-            raise TimeoutError("Timeout waiting for open order data.")
+            self.logger.warning("Timeout waiting for open order data.")
         self.logger.info(f"Found {len(self.open_orders)} open orders.")
 
         self.account_summary_event.clear()
@@ -327,17 +358,77 @@ class IBApp(EWrapper, EClient):
             raise ValueError(f"Net Liquidation Value is invalid: {self.net_liquidation_value}")
         self.logger.info(f"Net Liquidation Value: {self.net_liquidation_value}")
 
+    def prepare_tradable_tickers(self):
+        """
+        Performs pre-market checks to identify tickers that are accessible
+        and have sufficient historical data.
+        """
+        self.logger.info("--- Starting Pre-Market Ticker Preparation ---")
+        
+        # 1. Load all available historical data from the local database
+        try:
+            self.historical_data_cache = self.data_manager.get_all_latest_data()
+            if not self.historical_data_cache:
+                self.logger.critical("Could not load any historical data. Aborting trading session.")
+                return
+        except Exception as e:
+            self.logger.critical(f"Failed loading historical data during pre-market prep: {e}", exc_info=True)
+            return
+
+        # 2. Filter tickers based on data availability and a minimum length of 35 days
+        self.logger.info(f"Found historical data for {len(self.historical_data_cache)} tickers.")
+        tickers_with_enough_data = [
+            ticker for ticker, df in self.historical_data_cache.items() if len(df) >= 35
+        ]
+        self.logger.info(f"{len(tickers_with_enough_data)} tickers have sufficient historical data.")
+        
+        if not tickers_with_enough_data:
+            self.logger.warning("No tickers have enough data for trading.")
+            return
+
+        # 3. Verify contract accessibility with IBKR sequentially
+        self.logger.info("Verifying ticker accessibility with Interactive Brokers...")
+        self.tradable_tickers = [] # Reset the list for the new session
+        req_id_counter = 5000  # High number to avoid collisions with other requests
+
+        for ticker in tickers_with_enough_data:
+            if SHUTDOWN_EVENT.is_set():
+                self.logger.info("Shutdown requested, aborting ticker verification.")
+                break
+            
+            reqId = req_id_counter
+            req_id_counter += 1
+            
+            event = threading.Event()
+            self.active_contract_requests[reqId] = {'ticker': ticker, 'event': event}
+            
+            contract = self._create_contract(ticker)
+            self.logger.debug(f"Requesting contract details for {ticker} with ReqId {reqId}.")
+            self.reqContractDetails(reqId, contract)
+
+            event_was_set = event.wait(timeout=10)
+            if not event_was_set:
+                self.logger.error(f"Timeout waiting for contract details for {ticker}. It will be excluded.")
+            
+            del self.active_contract_requests[reqId]
+            time.sleep(0.2) # Pacing to be safe
+
+        self.logger.info(f"--- Pre-Market Ticker Preparation Complete ---")
+        self.logger.info(f"Found {len(self.tradable_tickers)} tradable tickers: {self.tradable_tickers}")
+
+
     def run_overnight_session(self):
         """Fetches the previous day's data and updates the local database."""
         self.logger.info("Starting OVERNIGHT data update session.")
         bars_to_update: Dict[str, dict] = {}
+        req_id_offset = 1000
 
-        for i, ticker in enumerate(self.tickers):
+        for i, ticker in enumerate(self.all_tickers):
             if SHUTDOWN_EVENT.is_set():
                 self.logger.info("Shutdown requested; aborting overnight session loop.")
                 break
 
-            reqId = i + 1000
+            reqId = i + req_id_offset
             contract = self._create_contract(ticker)
             completion_event = threading.Event()
             self.active_requests[reqId] = completion_event
@@ -354,17 +445,19 @@ class IBApp(EWrapper, EClient):
                 self.cancelHistoricalData(reqId)
 
             while not self.historical_data_queue.empty():
-                item = self.historical_data_queue.get_nowait()
-                if item['reqId'] == reqId:
-                    bars_to_update[ticker] = item['data']
-                    self.logger.info(f"Fetched daily bar for {ticker}")
+                try:
+                    item = self.historical_data_queue.get_nowait()
+                    if item.get('reqId') == reqId:
+                        bars_to_update[ticker] = item['data']
+                        self.logger.info(f"Fetched daily bar for {ticker}")
+                        break
+                except queue.Empty:
                     break
-
+            
             del self.active_requests[reqId]
-            for _ in range(2):
-                if SHUTDOWN_EVENT.is_set():
-                    break
-                time.sleep(1)
+            # PACING: Wait 11 seconds between historical data requests to stay well clear of the 
+            # 60 requests per 10 minutes limit.
+            time.sleep(11)
 
         if bars_to_update:
             self.logger.info(f"Finished fetching data. Updating database for {len(bars_to_update)} tickers.")
@@ -375,22 +468,14 @@ class IBApp(EWrapper, EClient):
         self.logger.info("Overnight session complete.")
 
     def run_trading_session(self):
-        """Main logic for a live trading day."""
+        """Main logic for a live trading day using pre-vetted tickers."""
         if SHUTDOWN_EVENT.is_set():
             return
 
-        try:
-            self.historical_data_cache = self.data_manager.get_all_latest_data()
-        except Exception as e:
-            self.logger.critical(f"Failed loading historical data: {e}", exc_info=True)
+        if not self.tradable_tickers or not self.historical_data_cache:
+            self.logger.critical("No tradable tickers or historical data available. Aborting.")
             return
 
-        if not self.historical_data_cache:
-            self.logger.critical("Could not load any historical data. Aborting.")
-            return
-
-        if SHUTDOWN_EVENT.is_set():
-            return
         self.request_opening_prices()
 
         try:
@@ -400,11 +485,13 @@ class IBApp(EWrapper, EClient):
             return
 
         if not predictions:
-            self.logger.warning("No predictions generated.")
+            self.logger.warning("No predictions were generated by the model.")
             return
 
-        valid_predictions = {k: v for k, v in predictions.items()
-                             if k in self.open_prices and isinstance(v, (int, float)) and math.isfinite(v)}
+        valid_predictions = {
+            k: v for k, v in predictions.items() 
+            if k in self.open_prices and isinstance(v, (int, float)) and math.isfinite(v)
+        }
         if not valid_predictions:
             self.logger.warning("No valid predictions with available opening prices.")
             return
@@ -417,15 +504,16 @@ class IBApp(EWrapper, EClient):
         if not _is_finite_positive(self.net_liquidation_value):
             self.logger.error("Cannot trade due to invalid Net Liquidation Value.")
             return
-        if best_ticker not in self.open_prices or not _is_finite_positive(self.open_prices[best_ticker]):
-            self.logger.error("Cannot trade due to missing/invalid opening price for the chosen stock.")
+        
+        open_price = self.open_prices.get(best_ticker)
+        if not _is_finite_positive(open_price):
+            self.logger.error(f"Cannot trade due to missing/invalid opening price for {best_ticker}.")
             return
-
-        open_price = float(self.open_prices[best_ticker])
+        
         quantity = int(self.net_liquidation_value / open_price)
 
         if quantity < 1:
-            self.logger.error(f"Calculated order size is less than 1 share. Aborting.")
+            self.logger.error(f"Calculated order size is less than 1 share for {best_ticker}. Aborting.")
             return
         self.logger.info(f"Calculated order size: {quantity} shares.")
 
@@ -443,6 +531,7 @@ class IBApp(EWrapper, EClient):
         if SHUTDOWN_EVENT.is_set():
             return
         self.monitor_and_close_loop(best_ticker, action, quantity)
+
 
     def execute_what_if_check(self, contract: Contract, order: Order) -> bool:
         """Runs a What-If order and validates the margin impact."""
@@ -463,8 +552,9 @@ class IBApp(EWrapper, EClient):
             self.logger.error("Did not receive valid margin data from What-If check.")
             return False
 
-        self.logger.info("What-If check successful. Margin impact is acceptable.")
+        self.logger.info(f"What-If check successful. Margin impact: {self.what_if_result}")
         return True
+
 
     def monitor_and_close_loop(self, ticker: str, original_action: str, quantity: float):
         """Keeps the script alive and triggers the closing order at the right time."""
@@ -482,18 +572,16 @@ class IBApp(EWrapper, EClient):
         _safe_sleep_until(submission_time, config.TIMEZONE)
 
         if not SHUTDOWN_EVENT.is_set():
-            self.close_all_positions(ticker, original_action, quantity)
+            self.close_position(ticker, original_action, quantity)
 
         self.logger.info("Closing order sent. Shutting down in 60 seconds.")
-        for _ in range(60):
-            if SHUTDOWN_EVENT.is_set():
-                break
-            time.sleep(1)
+        time.sleep(60)
 
-    def close_all_positions(self, ticker: str, original_action: str, quantity: float):
+
+    def close_position(self, ticker: str, original_action: str, quantity: float):
         """Places a Market-on-Close order to close the day's position with a fallback."""
         if quantity <= 0:
-            self.logger.error("close_all_positions called with non-positive quantity; aborting.")
+            self.logger.error("close_position called with non-positive quantity; aborting.")
             return
 
         closing_action = "SELL" if original_action == "BUY" else "BUY"
@@ -504,10 +592,7 @@ class IBApp(EWrapper, EClient):
         moc_order_id = self.get_next_order_id()
         self.placeOrder(moc_order_id, closing_contract, moc_order)
 
-        for _ in range(5):
-            if SHUTDOWN_EVENT.is_set():
-                break
-            time.sleep(1)
+        time.sleep(5)
 
         if self.open_orders.get(moc_order_id, {}).get('status') == 'Cancelled':
             self.logger.warning("MOC order was rejected/cancelled! Attempting fallback with MKT order.")
@@ -515,27 +600,47 @@ class IBApp(EWrapper, EClient):
             self.placeOrder(self.get_next_order_id(), closing_contract, mkt_order)
 
     def request_opening_prices(self):
-        """Requests snapshot of opening prices for all tickers."""
-        self.logger.info(f"Requesting opening prices for {len(self.tickers)} stocks...")
-        for ticker in self.tickers:
-            reqId = self.open_price_ticker_map.get(ticker)
-            if reqId:
-                contract = self._create_contract(ticker)
-                try:
-                    self.reqMktData(reqId, contract, "", True, False, [])
-                except Exception as e:
-                    self.logger.error(f"reqMktData failed for {ticker}: {e}")
+        """Requests snapshot of opening prices for all TRADABLE tickers."""
+        if not self.tradable_tickers:
+            self.logger.warning("No tradable tickers to request opening prices for.")
+            return
+            
+        self.logger.info(f"Requesting opening prices for {len(self.tradable_tickers)} tradable stocks...")
+        
+        # Rebuild the request ID maps based on the filtered list of tradable tickers
+        self.open_prices = {}
+        self.open_price_req_ids = {i + 1: ticker for i, ticker in enumerate(self.tradable_tickers)}
+        self.open_price_ticker_map = {v: k for k, v in self.open_price_req_ids.items()}
+        
+        for ticker in self.tradable_tickers:
+            reqId = self.open_price_ticker_map[ticker]
+            contract = self._create_contract(ticker)
+            try:
+                # Request a single snapshot (snapshot=True)
+                self.reqMktData(reqId, contract, "", True, False, [])
+            except Exception as e:
+                self.logger.error(f"reqMktData failed for {ticker}: {e}")
 
         start_time = time.time()
-        while (time.time() - start_time < config.OPENING_PRICE_TIMEOUT_SECONDS) and not SHUTDOWN_EVENT.is_set():
-            if len(self.open_prices) == len(self.tickers):
-                self.logger.info("All opening prices received.")
+        timeout = config.OPENING_PRICE_TIMEOUT_SECONDS
+        while (time.time() - start_time < timeout) and not SHUTDOWN_EVENT.is_set():
+            if len(self.open_prices) == len(self.tradable_tickers):
+                self.logger.info("All opening prices for tradable tickers received.")
                 break
             time.sleep(1)
+        else:
+            self.logger.warning(
+                f"Finished opening price collection after {timeout}s. "
+                f"Received {len(self.open_prices)}/{len(self.tradable_tickers)} prices."
+            )
+        
+        # Cancel any requests that didn't get a response
+        for req_id in self.open_price_req_ids:
+            if self.open_price_req_ids[req_id] not in self.open_prices:
+                self.cancelMktData(req_id)
 
-        self.logger.info(f"Finished opening price collection. Received {len(self.open_prices)}/{len(self.tickers)} prices.")
 
-    def get_next_order_id(self):
+    def get_next_order_id(self) -> int:
         with self._id_lock:
             if self.next_order_id is None:
                 raise RuntimeError("next_order_id is not initialized yet.")
@@ -546,10 +651,9 @@ class IBApp(EWrapper, EClient):
     def shutdown(self):
         self.logger.info("Shutting down bot.")
         SHUTDOWN_EVENT.set()
-        try:
+        time.sleep(1) # Give threads a moment to see the event
+        if self.isConnected():
             self.disconnect()
-        except Exception:
-            pass
 
 
 def main():
@@ -583,7 +687,7 @@ def main():
         logger.error(f"Failed to get market schedule: {e}")
         is_trading_day = False
 
-    if not is_trading_day:
+    if not is_trading_day and args.mode == 'trading':
         logger.info("Today is not a trading day. Exiting.")
         return
 
@@ -601,25 +705,22 @@ def main():
         if args.mode == 'trading':
             logger.info("--- Starting TRADING session ---")
             app.sync_state()
+            app.prepare_tradable_tickers()
 
-            try:
-                open_ts, _ = _validate_schedule(get_market_schedule_for_date(today, lse_calendar))
-                now_local = datetime.now(pytz.timezone(config.TIMEZONE))
-                wait_seconds = (open_ts.to_pydatetime() - now_local).total_seconds()
-                if wait_seconds > 0:
-                    logger.info(f"Waiting {wait_seconds:.0f} seconds for market open...")
-                    _safe_sleep_until(open_ts.to_pydatetime(), config.TIMEZONE)
-            except Exception as e:
-                logger.error(f"Could not determine or wait for market open: {e}")
-
-            if not SHUTDOWN_EVENT.is_set():
-                app.run_trading_session()
+            if not app.tradable_tickers:
+                logger.critical("No tradable tickers found. Shutting down.")
+            else:
+                open_ts, _ = _validate_schedule(schedule)
+                _safe_sleep_until(open_ts.to_pydatetime(), config.TIMEZONE)
+                
+                if not SHUTDOWN_EVENT.is_set():
+                    app.run_trading_session()
 
         elif args.mode == 'overnight':
             logger.info("--- Starting OVERNIGHT data update ---")
             app.run_overnight_session()
 
-    except (ConnectionError, TimeoutError) as e:
+    except (ConnectionError, TimeoutError, ValueError) as e:
         logger.critical(f"A connection or setup error occurred: {e}")
     except KeyboardInterrupt:
         logger.info("Bot stopped manually by user.")
