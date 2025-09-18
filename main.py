@@ -12,7 +12,7 @@ import queue
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
-import pytz  # <-- Added/ensured: pytz is imported
+import pytz
 from ibapi.client import EClient
 from ibapi.wrapper import EWrapper
 from ibapi.contract import Contract
@@ -174,16 +174,16 @@ class IBApp(EWrapper, EClient):
         self.historical_data_end_event = threading.Event()
 
     # --- EWrapper Callbacks (Handles incoming messages from IB) ---
-    # (IB API behavior left as-is; only minor safety parsing where applicable)
+    def error(self, reqId: TickerId, errorCode: int, errorString: str, advancedOrderRejectJson: str = "", errorTime: int = 0):
+        """Catches errors from the API."""
+        if errorCode in [162, 2104, 2106, 2107, 2158, 2176]:
+            print(f"INFO (ReqId: {reqId}): {errorString}")
+            return
 
-    def error(self, reqId: TickerId, errorCode: int, errorString: str, advancedOrderRejectJson=""):
-        if errorCode in [2104, 2106, 2158, 2108, 2103, 2105, 2107, 2176, 162]:
-            self.logger.info(f"IB Info (ReqId: {reqId}): {errorString}")
-        else:
-            self.logger.error(f"Error (ReqId: {reqId}, Code: {errorCode}): {errorString}")
-
-        if reqId in self.active_requests:
-            self.active_requests[reqId].set()
+        print(f"ERROR - ReqId: {reqId}, Code: {errorCode}, Msg: {errorString}")
+        
+        if reqId != -1 and self.data_received_event:
+            self.data_received_event.set()
 
     def nextValidId(self, orderId: int):
         super().nextValidId(orderId)
@@ -263,7 +263,28 @@ class IBApp(EWrapper, EClient):
             self.active_requests[reqId].set()
             self.logger.info(f"Historical data end for ReqId: {reqId}")
 
-    # --- Core Bot Methods (non-IB logic hardened; IB calls untouched) ---
+    # --- Core Bot Methods ---
+
+    def _create_contract(self, symbol: str) -> Contract:
+        """Creates a Contract object for a LSE stock."""
+        contract = Contract()
+        contract.symbol = symbol
+        contract.secType = "STK"
+        contract.exchange = "LSE"
+        contract.currency = "GBP"
+        return contract
+
+    def _create_order(self, action: str, quantity: float, order_type: str = "MKT") -> Order:
+        """Creates a basic Order object."""
+        order = Order()
+        order.action = action
+        order.totalQuantity = quantity
+        order.orderType = order_type
+        if order_type == "MOC":
+            order.tif = "GTC"
+        else:
+            order.tif = "DAY"
+        return order
 
     def connect_and_start(self):
         """Connects to IB Gateway and starts the message processing thread."""
@@ -283,7 +304,7 @@ class IBApp(EWrapper, EClient):
             raise TimeoutError("Did not receive nextValidId from IB Gateway.")
 
     def sync_state(self):
-        """Synchronizes bot's state with the broker (positions, orders, account value)."""
+        """Synchronizes bot's state with the broker."""
         self.logger.info("Syncing state with broker...")
 
         self.position_end_event.clear()
@@ -316,9 +337,8 @@ class IBApp(EWrapper, EClient):
                 self.logger.info("Shutdown requested; aborting overnight session loop.")
                 break
 
-            reqId = i + 1000  # distinct ID range
+            reqId = i + 1000
             contract = self._create_contract(ticker)
-
             completion_event = threading.Event()
             self.active_requests[reqId] = completion_event
 
@@ -334,21 +354,24 @@ class IBApp(EWrapper, EClient):
                 self.cancelHistoricalData(reqId)
 
             while not self.historical_data_queue.empty():
-                item = self.historical_data_queue.get()
+                item = self.historical_data_queue.get_nowait()
                 if item['reqId'] == reqId:
                     bars_to_update[ticker] = item['data']
                     self.logger.info(f"Fetched daily bar for {ticker}")
                     break
 
             del self.active_requests[reqId]
-            # pacing, but allow early shutdown
             for _ in range(2):
                 if SHUTDOWN_EVENT.is_set():
                     break
                 time.sleep(1)
 
-        self.logger.info(f"Finished fetching data. Ready to update database for {len(bars_to_update)} tickers.")
-        # self.data_manager.update_database(bars_to_update)
+        if bars_to_update:
+            self.logger.info(f"Finished fetching data. Updating database for {len(bars_to_update)} tickers.")
+            self.data_manager.update_raw_database(bars_to_update)
+        else:
+            self.logger.info("No new bars were fetched to update.")
+
         self.logger.info("Overnight session complete.")
 
     def run_trading_session(self):
@@ -366,12 +389,10 @@ class IBApp(EWrapper, EClient):
             self.logger.critical("Could not load any historical data. Aborting.")
             return
 
-        # 1. Request opening prices
         if SHUTDOWN_EVENT.is_set():
             return
         self.request_opening_prices()
 
-        # 2. Make trading decision
         try:
             predictions = self.model_handler.predict(self.historical_data_cache, self.open_prices)
         except Exception as e:
@@ -379,49 +400,46 @@ class IBApp(EWrapper, EClient):
             return
 
         if not predictions:
-            self.logger.warning("No predictions were generated. No trades will be placed.")
+            self.logger.warning("No predictions generated.")
             return
 
-        predictions = {k: v for k, v in predictions.items()
-                       if k in self.open_prices and isinstance(v, (int, float)) and math.isfinite(v)}
-        if not predictions:
-            self.logger.warning("No valid predictions with available opening prices. No trades will be placed.")
+        valid_predictions = {k: v for k, v in predictions.items()
+                             if k in self.open_prices and isinstance(v, (int, float)) and math.isfinite(v)}
+        if not valid_predictions:
+            self.logger.warning("No valid predictions with available opening prices.")
             return
 
-        best_ticker = max(predictions, key=lambda k: abs(predictions[k]))
-        predicted_log_return = float(predictions[best_ticker])
+        best_ticker = max(valid_predictions, key=lambda k: abs(valid_predictions[k]))
+        predicted_log_return = float(valid_predictions[best_ticker])
         action = "BUY" if predicted_log_return > 0 else "SELL"
         self.logger.info(f"Strategy decided: {action} {best_ticker} (Predicted Log Return: {predicted_log_return:.4f})")
 
-        # 3. Calculate order size and create order objects
         if not _is_finite_positive(self.net_liquidation_value):
-            self.logger.error("Cannot trade. Invalid Net Liq.")
+            self.logger.error("Cannot trade due to invalid Net Liquidation Value.")
             return
         if best_ticker not in self.open_prices or not _is_finite_positive(self.open_prices[best_ticker]):
-            self.logger.error("Cannot trade. Missing or invalid opening price for chosen stock.")
+            self.logger.error("Cannot trade due to missing/invalid opening price for the chosen stock.")
             return
 
         open_price = float(self.open_prices[best_ticker])
         quantity = int(self.net_liquidation_value / open_price)
+
         if quantity < 1:
-            self.logger.error(f"Calculated order size < 1 share (NetLiq={self.net_liquidation_value}, Open={open_price}). Aborting.")
+            self.logger.error(f"Calculated order size is less than 1 share. Aborting.")
             return
         self.logger.info(f"Calculated order size: {quantity} shares.")
 
         opening_contract = self._create_contract(best_ticker)
         opening_order = self._create_order(action, quantity)
 
-        # 4. Perform "What-If" check
         if not self.execute_what_if_check(opening_contract, opening_order):
-            self.logger.critical("What-If check failed or indicated unacceptable margin. Aborting trade.")
+            self.logger.critical("What-If check failed. Aborting trade.")
             return
 
-        # 5. Place the LIVE opening order
         self.logger.info(f"Placing LIVE OPENING order for {quantity} {best_ticker}...")
         live_order_id = self.get_next_order_id()
         self.placeOrder(live_order_id, opening_contract, opening_order)
 
-        # 6. Enter main monitoring loop until it's time to close
         if SHUTDOWN_EVENT.is_set():
             return
         self.monitor_and_close_loop(best_ticker, action, quantity)
@@ -429,9 +447,9 @@ class IBApp(EWrapper, EClient):
     def execute_what_if_check(self, contract: Contract, order: Order) -> bool:
         """Runs a What-If order and validates the margin impact."""
         self.logger.info("Performing What-If margin check...")
-        what_if_order = order
+        what_if_order = self._create_order(order.action, order.totalQuantity, order.orderType)
         what_if_order.whatIf = True
-        self.what_if_result = None  # Reset previous result
+        self.what_if_result = None
 
         what_if_id = self.get_next_order_id()
         self.open_order_end_event.clear()
@@ -459,10 +477,7 @@ class IBApp(EWrapper, EClient):
             return
 
         submission_time = (close_ts - pd.Timedelta(minutes=config.MOC_SUBMISSION_WINDOW_MINUTES)).to_pydatetime()
-        self.logger.info(
-            f"Market closes at {close_ts.strftime('%H:%M:%S')}. "
-            f"MOC order will be sent at {submission_time.strftime('%H:%M:%S')}."
-        )
+        self.logger.info(f"Market closes at {close_ts.strftime('%H:%M:%S')}. MOC order will be sent at {submission_time.strftime('%H:%M:%S')}.")
 
         _safe_sleep_until(submission_time, config.TIMEZONE)
 
@@ -470,7 +485,6 @@ class IBApp(EWrapper, EClient):
             self.close_all_positions(ticker, original_action, quantity)
 
         self.logger.info("Closing order sent. Shutting down in 60 seconds.")
-        # Allow early shutdown during the cool-down
         for _ in range(60):
             if SHUTDOWN_EVENT.is_set():
                 break
@@ -479,7 +493,7 @@ class IBApp(EWrapper, EClient):
     def close_all_positions(self, ticker: str, original_action: str, quantity: float):
         """Places a Market-on-Close order to close the day's position with a fallback."""
         if quantity <= 0:
-            self.logger.error("close_all_positions called with non-positive quantity; aborting close.")
+            self.logger.error("close_all_positions called with non-positive quantity; aborting.")
             return
 
         closing_action = "SELL" if original_action == "BUY" else "BUY"
@@ -487,18 +501,16 @@ class IBApp(EWrapper, EClient):
 
         closing_contract = self._create_contract(ticker)
         moc_order = self._create_order(closing_action, quantity, order_type="MOC")
-
         moc_order_id = self.get_next_order_id()
         self.placeOrder(moc_order_id, closing_contract, moc_order)
 
-        # brief wait to detect immediate rejection, but respect shutdown
         for _ in range(5):
             if SHUTDOWN_EVENT.is_set():
                 break
             time.sleep(1)
 
         if self.open_orders.get(moc_order_id, {}).get('status') == 'Cancelled':
-            self.logger.warning("MOC order was rejected or cancelled! Attempting fallback with MKT order.")
+            self.logger.warning("MOC order was rejected/cancelled! Attempting fallback with MKT order.")
             mkt_order = self._create_order(closing_action, quantity, order_type="MKT")
             self.placeOrder(self.get_next_order_id(), closing_contract, mkt_order)
 
@@ -533,7 +545,7 @@ class IBApp(EWrapper, EClient):
 
     def shutdown(self):
         self.logger.info("Shutting down bot.")
-        SHUTDOWN_EVENT.set()  # Signal all loops to terminate
+        SHUTDOWN_EVENT.set()
         try:
             self.disconnect()
         except Exception:
@@ -542,7 +554,6 @@ class IBApp(EWrapper, EClient):
 
 def main():
     """Main entry point for the bot."""
-    # Ensure early config/env validation provides actionable errors
     try:
         _validate_config_and_env()
     except Exception as e:
@@ -551,7 +562,6 @@ def main():
 
     logger = setup_logging(Path(config.BASE_DIR) / "logs")
 
-    # Clean termination on signals
     def _handle_signal(signum, frame):
         logger.info(f"Received signal {signum}. Shutting down gracefully.")
         SHUTDOWN_EVENT.set()
@@ -577,7 +587,6 @@ def main():
         logger.info("Today is not a trading day. Exiting.")
         return
 
-    # Ticker loading with strong validation
     try:
         tickers = _load_tickers(Path(config.TICKER_FILE))
     except Exception as e:
@@ -593,7 +602,6 @@ def main():
             logger.info("--- Starting TRADING session ---")
             app.sync_state()
 
-            # Wait for market open safely (if not already open)
             try:
                 open_ts, _ = _validate_schedule(get_market_schedule_for_date(today, lse_calendar))
                 now_local = datetime.now(pytz.timezone(config.TIMEZONE))
