@@ -35,6 +35,7 @@ IB_CLIENT_ID = 101     # A unique ID for this bot instance to avoid conflicts
 
 # --- STRATEGY PARAMETERS 📈 ---
 # These variables control the bot's trading behavior.
+RAW_DATA_HISTORY_DAYS = 60
 MARKET_CALENDAR = "LSE"
 TIMEZONE = "Europe/London"
 
