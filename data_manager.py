@@ -126,8 +126,11 @@ class DataManager:
                     df = self._coerce_numeric(df, list(REQUIRED_OHLCV_COLS), ticker)
 
                     # Ensure we have at least enough data for the model handler to work with
+                    # First, drop any rows with missing OHLCV data to handle gaps
+                    df = df.dropna(subset=list(REQUIRED_OHLCV_COLS))
+
                     if len(df) < (config.WINDOW_SIZE + 20): # 20 is for longest indicator
-                        logger.warning(f"Skipping {ticker}: has only {len(df)} valid rows, not enough for feature generation.")
+                        logger.warning(f"Skipping {ticker}: has only {len(df)} valid, contiguous rows, not enough for feature generation.")
                         continue
                     
                     all_latest_data[ticker] = df.loc[:, list(REQUIRED_OHLCV_COLS)].sort_index()
