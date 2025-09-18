@@ -35,7 +35,7 @@ IB_CLIENT_ID = 101     # A unique ID for this bot instance to avoid conflicts
 
 # --- STRATEGY PARAMETERS 📈 ---
 # These variables control the bot's trading behavior.
-RAW_DATA_HISTORY_DAYS = 60
+RAW_DATA_HISTORY_DAYS = 90
 MARKET_CALENDAR = "LSE"
 TIMEZONE = "Europe/London"
 
@@ -70,3 +70,4 @@ INDICATORS = [
     {"method": "roc", "params": {"length": 12}, "output_cols": ["ROC_12"]},
     {"method": "willr", "params": {"length": 14}, "output_cols": ["WILLR_14"]},
 ]
+
