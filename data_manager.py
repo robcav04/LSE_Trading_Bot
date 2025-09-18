@@ -91,26 +91,30 @@ class DataManager:
     # Public methods
     # --------------------------
 
+
     def get_all_latest_data(self) -> Dict[str, pd.DataFrame]:
         """
-        Efficiently loads the most recent 'WINDOW_SIZE' data points of raw
+        Loads the most recent 'RAW_DATA_HISTORY_DAYS' data points of raw
         OHLCV data for all stocks available in the HDF5 file.
         """
         if not self.db_path.exists():
             raise FileNotFoundError(f"Cannot load data; raw database file does not exist at {self.db_path}")
 
-        window = int(config.WINDOW_SIZE)
-        logger.info(f"Loading latest {window}-day raw data for all stocks...")
+        history_needed = int(config.RAW_DATA_HISTORY_DAYS)
+        logger.info(f"Loading latest {history_needed}-day raw data for all stocks...")
         all_latest_data: Dict[str, pd.DataFrame] = {}
 
         try:
             with pd.HDFStore(self.db_path, mode="r") as store:
                 keys = [k.strip("/") for k in store.keys()]
                 for ticker in tqdm(keys, desc="Loading Raw Historical Data"):
-                    df = self._select_last_n_rows(store, ticker, window, ticker_for_log=ticker)
+                    # Use the corrected history_needed variable here
+                    df = self._select_last_n_rows(store, ticker, history_needed, ticker_for_log=ticker)
+                    
                     if df is None or df.empty:
                         continue
 
+                    # The rest of the validation logic remains the same
                     if not isinstance(df.index, pd.DatetimeIndex):
                         df.index = pd.to_datetime(df.index, errors="coerce")
                         if df.index.isna().any():
@@ -121,8 +125,9 @@ class DataManager:
                         continue
                     df = self._coerce_numeric(df, list(REQUIRED_OHLCV_COLS), ticker)
 
-                    if len(df) != window:
-                        logger.warning(f"Skipping {ticker}: found {len(df)} valid rows, require {window}.")
+                    # Ensure we have at least enough data for the model handler to work with
+                    if len(df) < (config.WINDOW_SIZE + 20): # 20 is for longest indicator
+                        logger.warning(f"Skipping {ticker}: has only {len(df)} valid rows, not enough for feature generation.")
                         continue
                     
                     all_latest_data[ticker] = df.loc[:, list(REQUIRED_OHLCV_COLS)].sort_index()
@@ -135,38 +140,52 @@ class DataManager:
 
     def update_raw_database(self, bars_to_update: Dict[str, dict]):
         """
-        Appends new daily bars to the raw historical HDF5 database.
+        Appends new daily bars and removes the oldest to maintain a constant
+        rolling window of historical data in the HDF5 database.
         """
         if not bars_to_update:
             logger.warning("No new bars provided to update_raw_database.")
             return
-        
+
         if not self.db_path.exists():
-            logger.error(f"Cannot update; raw database file does not exist at {self.db_path}. Run a seeding process first.")
+            logger.error(f"Cannot update; raw database file does not exist at {self.db_path}. Run the initialisation script first.")
             return
 
-        logger.info(f"Updating raw database with {len(bars_to_update)} new daily bars...")
+        logger.info(f"Updating raw database with {len(bars_to_update)} new bars, maintaining a {config.RAW_DATA_HISTORY_DAYS}-day window.")
         
+        updated_count = 0
         try:
+            # Use mode="a" to read and write to the existing file
             with pd.HDFStore(self.db_path, mode="a") as store:
                 for ticker, bar_data in bars_to_update.items():
+                    safe_key = self._sanitize_key(ticker)
                     try:
+                        # Create a DataFrame for the new bar
                         df_new = pd.DataFrame([bar_data])
-                        df_new["Date"] = df_new["Date"].apply(self._parse_date_value)
+                        df_new["Date"] = pd.to_datetime(df_new["Date"], format="%Y%m%d")
                         df_new.set_index("Date", inplace=True)
 
-                        if not self._validate_ohlcv_columns(df_new, ticker):
-                            continue
-                        df_new = self._coerce_numeric(df_new, list(REQUIRED_OHLCV_COLS), ticker)
-                        if df_new.empty:
-                            continue
+                        # Read the existing data for the ticker
+                        df_old = store.get(safe_key)
 
-                        safe_key = self._sanitize_key(ticker)
-                        store.append(safe_key, df_new, format="table", data_columns=True)
+                        # Combine old and new data
+                        df_combined = pd.concat([df_old, df_new])
+
+                        # Remove duplicates and sort by date to be safe
+                        df_combined = df_combined[~df_combined.index.duplicated(keep='last')].sort_index()
+
+                        # Keep only the most recent N days
+                        df_rolled = df_combined.tail(config.RAW_DATA_HISTORY_DAYS)
+
+                        # Overwrite the old data with the new rolling window
+                        store.put(safe_key, df_rolled, format="table", data_columns=True)
+                        updated_count += 1
 
                     except Exception as e:
-                        logger.error(f"Failed to update database for ticker {ticker}: {e}")
-            logger.info("Successfully updated the raw database.")
+                        logger.error(f"Failed to update rolling window for ticker {ticker}: {e}")
+            
+            logger.info(f"Successfully updated the raw database for {updated_count} tickers.")
+
         except Exception as e:
             logger.critical(f"A critical error occurred while writing to the HDF5 database: {e}", exc_info=True)
     
