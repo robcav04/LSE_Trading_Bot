@@ -306,6 +306,7 @@ class IBApp(EWrapper, EClient):
         contract.secType = "STK"
         contract.exchange = "LSE"
         contract.currency = "GBP"
+        contract.primaryExchange = "LSE"
         return contract
 
     def _create_order(self, action: str, quantity: float, order_type: str = "MKT") -> Order:
