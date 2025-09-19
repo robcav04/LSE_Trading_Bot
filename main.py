@@ -260,13 +260,12 @@ class IBApp(EWrapper, EClient):
         self.cancelAccountSummary(reqId)
 
     def tickPrice(self, reqId: TickerId, tickType: int, price: float, attrib):
-        # Tick type 14 is 'OPEN_TICK', often the official open but can be delayed.
-        # Tick type 68 is 'DELAYED_OPEN', a reliable fallback.
-        if tickType in [14, 68] and reqId in self.open_price_req_ids:
+        # Only use tick type 14 (OPEN_TICK) for the opening price.
+        if tickType == 14 and reqId in self.open_price_req_ids:
             ticker = self.open_price_req_ids[reqId]
             if ticker not in self.open_prices and _is_finite_positive(price):
                 self.open_prices[ticker] = price
-                self.logger.info(f"Received opening price for {ticker}: {price}")
+                self.logger.info(f"Received opening price for {ticker} (TickType 14): {price}")
                 self.cancelMktData(reqId)
 
     def historicalData(self, reqId: int, bar: BarData):
@@ -734,3 +733,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
