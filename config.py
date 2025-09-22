@@ -10,7 +10,7 @@ BASE_DIR = Path(__file__).resolve().parent
 
 # Data sub-directory
 DATA_DIR = BASE_DIR / "data"
-TICKER_FILE = DATA_DIR / "Ticker_list.txt"
+TICKER_FILE = DATA_DIR / "valid_tickers.txt"
 
 # Path to the RAW historical data file (read by ModelHandler, written by overnight/seeder)
 RAW_DATABASE_PATH = DATA_DIR / "lse_daily_15y.h5"
@@ -35,7 +35,7 @@ IB_CLIENT_ID = 101     # A unique ID for this bot instance to avoid conflicts
 
 # --- STRATEGY PARAMETERS 📈 ---
 # These variables control the bot's trading behavior.
-RAW_DATA_HISTORY_DAYS = 90
+RAW_DATA_HISTORY_DAYS = 100
 MARKET_CALENDAR = "LSE"
 TIMEZONE = "Europe/London"
 
