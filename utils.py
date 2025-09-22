@@ -2,18 +2,23 @@
 import logging
 import sys
 from pathlib import Path
-from datetime import time
+from typing import Optional
 
 import pandas as pd
 import pandas_market_calendars as mcal
 
 import config
 
-def setup_logging(log_dir: Path):
+def setup_logging(log_dir: Path, log_filename: Optional[str] = None):
     """Configures logging to file and console."""
     log_dir.mkdir(exist_ok=True)
-    log_file = log_dir / f"bot_log_{pd.Timestamp.now().strftime('%Y%m%d')}.log"
-    
+
+    # Use a specific filename if provided, otherwise create a default one
+    if log_filename:
+        log_file = log_dir / log_filename
+    else:
+        log_file = log_dir / f"bot_log_{pd.Timestamp.now().strftime('%Y%m%d')}.log"
+
     logger = logging.getLogger("TradingBot")
     logger.setLevel(logging.INFO)
 
@@ -30,7 +35,7 @@ def setup_logging(log_dir: Path):
     sh = logging.StreamHandler(sys.stdout)
     sh.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
     logger.addHandler(sh)
-    
+
     return logger
 
 def get_lse_calendar():
