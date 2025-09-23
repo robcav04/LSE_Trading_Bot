@@ -9,7 +9,9 @@ import math
 from datetime import datetime
 from pathlib import Path
 import queue
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, DefaultDict
+from collections import defaultdict
+
 
 import pandas as pd
 import pytz
@@ -179,7 +181,7 @@ class IBApp(EWrapper, EClient):
     def error(self, reqId: TickerId, errorCode: int, errorString: str, advancedOrderRejectJson: str = "", errorTime: int = 0):
         """Catches errors from the API."""
         # Informational messages
-        if errorCode in [162, 2104, 2106, 2107, 2158, 2176]:
+        if errorCode in [162, 2104, 2106, 2107, 2158, 2176, 2119]:
             self.logger.info(f"INFO (ReqId: {reqId}): {errorString}")
             if reqId in self.active_contract_requests:
                 self.active_contract_requests[reqId]['event'].set() # Let valid info messages also unblock
@@ -315,7 +317,11 @@ class IBApp(EWrapper, EClient):
         order.totalQuantity = quantity
         order.orderType = order_type
         order.tif = "GTC" if order_type == "MOC" else "DAY"
+        # --- FIX for error 10268 ---
+        order.eTradeOnly = False
+        order.firmQuoteOnly = False
         return order
+
 
     def connect_and_start(self):
         """Connects to IB Gateway and starts the message processing thread."""
@@ -364,7 +370,7 @@ class IBApp(EWrapper, EClient):
         and have sufficient historical data.
         """
         self.logger.info("--- Starting Pre-Market Ticker Preparation ---")
-        
+
         # 1. Load all available historical data from the local database
         try:
             self.historical_data_cache = self.data_manager.get_all_latest_data()
@@ -381,7 +387,7 @@ class IBApp(EWrapper, EClient):
             ticker for ticker, df in self.historical_data_cache.items() if len(df) >= 35
         ]
         self.logger.info(f"{len(tickers_with_enough_data)} tickers have sufficient historical data.")
-        
+
         if not tickers_with_enough_data:
             self.logger.warning("No tickers have enough data for trading.")
             return
@@ -390,6 +396,8 @@ class IBApp(EWrapper, EClient):
         self.logger.info("Verifying ticker accessibility with Interactive Brokers...")
         self.tradable_tickers = [] # Reset the list for the new session
         req_id_counter = 5000  # High number to avoid collisions with other requests
+        
+        failed_tickers: DefaultDict[str, List[str]] = defaultdict(list)
 
         for ticker in tickers_with_enough_data:
             if SHUTDOWN_EVENT.is_set():
@@ -409,9 +417,15 @@ class IBApp(EWrapper, EClient):
             event_was_set = event.wait(timeout=10)
             if not event_was_set:
                 self.logger.error(f"Timeout waiting for contract details for {ticker}. It will be excluded.")
+                failed_tickers["Timeout"].append(ticker)
+            elif ticker not in self.tradable_tickers:
+                failed_tickers["Contract Not Found"].append(ticker)
+
             
             del self.active_contract_requests[reqId]
             time.sleep(0.2) # Pacing to be safe
+        
+        self.log_summary("Ticker Verification", len(tickers_with_enough_data), self.tradable_tickers, failed_tickers)
 
         self.logger.info(f"--- Pre-Market Ticker Preparation Complete ---")
         self.logger.info(f"Found {len(self.tradable_tickers)} tradable tickers: {self.tradable_tickers}")
@@ -422,6 +436,8 @@ class IBApp(EWrapper, EClient):
         self.logger.info("Starting OVERNIGHT data update session.")
         bars_to_update: Dict[str, dict] = {}
         req_id_offset = 1000
+        
+        failed_tickers: DefaultDict[str, List[str]] = defaultdict(list)
 
         for i, ticker in enumerate(self.all_tickers):
             if SHUTDOWN_EVENT.is_set():
@@ -437,12 +453,15 @@ class IBApp(EWrapper, EClient):
                 self.reqHistoricalData(reqId, contract, "", "1 D", "1 day", "TRADES", 1, 1, False, [])
             except Exception as e:
                 self.logger.error(f"reqHistoricalData failed for {ticker}: {e}")
+                failed_tickers["Request Failed"].append(ticker)
                 del self.active_requests[reqId]
                 continue
 
             if not completion_event.wait(15):
                 self.logger.error(f"Timeout getting historical data for {ticker}. Cancelling.")
                 self.cancelHistoricalData(reqId)
+                failed_tickers["Timeout"].append(ticker)
+
 
             while not self.historical_data_queue.empty():
                 try:
@@ -462,6 +481,7 @@ class IBApp(EWrapper, EClient):
         if bars_to_update:
             self.logger.info(f"Finished fetching data. Updating database for {len(bars_to_update)} tickers.")
             self.data_manager.update_raw_database(bars_to_update)
+            self.log_summary("Overnight Data Fetch", len(self.all_tickers), list(bars_to_update.keys()), failed_tickers)
         else:
             self.logger.info("No new bars were fetched to update.")
 
@@ -604,9 +624,11 @@ class IBApp(EWrapper, EClient):
         if not self.tradable_tickers:
             self.logger.warning("No tradable tickers to request opening prices for.")
             return
-            
+
         self.logger.info(f"Requesting opening prices for {len(self.tradable_tickers)} tradable stocks...")
         
+        failed_tickers: DefaultDict[str, List[str]] = defaultdict(list)
+
         # Rebuild the request ID maps based on the filtered list of tradable tickers
         self.open_prices = {}
         self.open_price_req_ids = {i + 1: ticker for i, ticker in enumerate(self.tradable_tickers)}
@@ -618,8 +640,11 @@ class IBApp(EWrapper, EClient):
             try:
                 # Request a single snapshot (snapshot=True)
                 self.reqMktData(reqId, contract, "", True, False, [])
+                time.sleep(0.025)  # --- FIX for pacing violation (error 10197) ---
             except Exception as e:
                 self.logger.error(f"reqMktData failed for {ticker}: {e}")
+                failed_tickers["Request Failed"].append(ticker)
+
 
         start_time = time.time()
         timeout = config.OPENING_PRICE_TIMEOUT_SECONDS
@@ -638,6 +663,10 @@ class IBApp(EWrapper, EClient):
         for req_id in self.open_price_req_ids:
             if self.open_price_req_ids[req_id] not in self.open_prices:
                 self.cancelMktData(req_id)
+                failed_tickers["Timeout"].append(self.open_price_req_ids[req_id])
+        
+        self.log_summary("Opening Price Retrieval", len(self.tradable_tickers), list(self.open_prices.keys()), failed_tickers)
+
 
 
     def get_next_order_id(self) -> int:
@@ -654,6 +683,16 @@ class IBApp(EWrapper, EClient):
         time.sleep(1) # Give threads a moment to see the event
         if self.isConnected():
             self.disconnect()
+
+    def log_summary(self, stage: str, total_tickers: int, successful_tickers: List[str], failed_tickers: Dict[str, List[str]]):
+        """Improved logging function to provide a summary of successes and failures."""
+        self.logger.info(f"--- {stage} Summary ---")
+        self.logger.info(f"Successfully processed {len(successful_tickers)} out of {total_tickers} tickers.")
+        if failed_tickers:
+            self.logger.warning(f"Failed to process {total_tickers - len(successful_tickers)} tickers:")
+            for reason, tickers in failed_tickers.items():
+                self.logger.warning(f"  - {reason}: {len(tickers)} tickers - {tickers}")
+        self.logger.info("-" * (len(stage) + 12))
 
 
 def main():
