@@ -153,6 +153,7 @@ class IBApp(EWrapper, EClient):
         self.open_orders: Dict[int, dict] = {}
         self.permId_to_orderId: Dict[int, int] = {}
         self.net_liquidation_value: float = 0.0
+        self.available_funds: float = 0.0
         self.what_if_result: Optional[dict] = None
         self.what_if_event = threading.Event()
 
@@ -258,6 +259,15 @@ class IBApp(EWrapper, EClient):
             except (ValueError, TypeError):
                 self.logger.error(f"Failed to parse NetLiquidation value '{value}'")
                 self.net_liquidation_value = 0.0
+        elif tag == "AvailableFunds" and currency == "GBP":
+            try:
+                self.available_funds = float(value)
+            except (ValueError, TypeError):
+                self.logger.error(f"Failed to parse AvailableFunds value '{value}'")
+                self.available_funds = 0.0
+
+        # Set the event if we have received both required values
+        if self.net_liquidation_value > 0 and self.available_funds > 0:
             self.account_summary_event.set()
 
     def accountSummaryEnd(self, reqId: int):
@@ -359,12 +369,13 @@ class IBApp(EWrapper, EClient):
         self.logger.info(f"Found {len(self.open_orders)} open orders.")
 
         self.account_summary_event.clear()
-        self.reqAccountSummary(self.REQ_ID_ACCOUNT_SUMMARY, "All", "NetLiquidation")
+        self.reqAccountSummary(self.REQ_ID_ACCOUNT_SUMMARY, "All", "NetLiquidation,AvailableFunds")
         if not self.account_summary_event.wait(10):
             raise TimeoutError("Timeout waiting for account summary.")
         if not _is_finite_positive(self.net_liquidation_value):
             raise ValueError(f"Net Liquidation Value is invalid: {self.net_liquidation_value}")
         self.logger.info(f"Net Liquidation Value: {self.net_liquidation_value}")
+        self.logger.info(f"Available Funds: {self.available_funds}")
 
     def prepare_tradable_tickers(self):
         """
@@ -509,7 +520,7 @@ class IBApp(EWrapper, EClient):
             return
 
         valid_predictions = {
-            k: v for k, v in predictions.items() 
+            k: v for k, v in predictions.items()
             if k in self.open_prices and isinstance(v, (int, float)) and math.isfinite(v)
         }
         if not valid_predictions:
@@ -521,27 +532,28 @@ class IBApp(EWrapper, EClient):
         action = "BUY" if predicted_log_return > 0 else "SELL"
         self.logger.info(f"Strategy decided: {action} {best_ticker} (Predicted Log Return: {predicted_log_return:.4f})")
 
-        if not _is_finite_positive(self.net_liquidation_value):
-            self.logger.error("Cannot trade due to invalid Net Liquidation Value.")
+        if not _is_finite_positive(self.available_funds):
+            self.logger.error("Cannot trade due to invalid Available Funds.")
             return
-        
+
         open_price = self.open_prices.get(best_ticker)
         if not _is_finite_positive(open_price):
             self.logger.error(f"Cannot trade due to missing/invalid opening price for {best_ticker}.")
             return
-        
-        quantity = int(self.net_liquidation_value / open_price)
+
+        capital_to_deploy = self.available_funds * config.RISK_FACTOR
+        quantity = int(capital_to_deploy / open_price)
 
         if quantity < 1:
-            self.logger.error(f"Calculated order size is less than 1 share for {best_ticker}. Aborting.")
+            self.logger.error(f"Calculated order size is less than 1 share for {best_ticker}. Capital to deploy: {capital_to_deploy:.2f}, Price: {open_price:.2f}. Aborting.")
             return
-        self.logger.info(f"Calculated order size: {quantity} shares.")
+        self.logger.info(f"Calculated order size: {quantity} shares based on {config.RISK_FACTOR*100}% of available funds.")
 
         opening_contract = self._create_contract(best_ticker)
         opening_order = self._create_order(action, quantity)
 
         if not self.execute_what_if_check(opening_contract, opening_order):
-            self.logger.critical("What-If check failed. Aborting trade.")
+            self.logger.critical("What-If check failed due to insufficient margin. Aborting trade.")
             return
 
         self.logger.info(f"Placing LIVE OPENING order for {quantity} {best_ticker}...")
@@ -551,7 +563,6 @@ class IBApp(EWrapper, EClient):
         if SHUTDOWN_EVENT.is_set():
             return
         self.monitor_and_close_loop(best_ticker, action, quantity)
-
 
     def execute_what_if_check(self, contract: Contract, order: Order) -> bool:
         """Runs a What-If order and validates the margin impact."""
@@ -568,11 +579,24 @@ class IBApp(EWrapper, EClient):
             self.logger.error("Timeout on What-If check response.")
             return False
 
-        if self.what_if_result is None or not self.what_if_result.get('initMargin'):
-            self.logger.error("Did not receive valid margin data from What-If check.")
+        if self.what_if_result is None:
+            self.logger.error("Did not receive a valid response from What-If check.")
             return False
 
-        self.logger.info(f"What-If check successful. Margin impact: {self.what_if_result}")
+        try:
+            init_margin_str = self.what_if_result.get('initMargin', '0').replace(',', '')
+            init_margin_change = float(init_margin_str)
+        except (ValueError, TypeError):
+            self.logger.error(f"Could not parse initial margin from What-If result: {self.what_if_result.get('initMargin')}")
+            return False
+
+        self.logger.info(f"What-If Check Results: Required Initial Margin = {init_margin_change:.2f}, Available Funds = {self.available_funds:.2f}")
+
+        if init_margin_change > self.available_funds:
+            self.logger.error("What-If check FAILED: Required initial margin exceeds available funds.")
+            return False
+
+        self.logger.info("What-If check PASSED: Sufficient funds for margin requirements.")
         return True
 
 
