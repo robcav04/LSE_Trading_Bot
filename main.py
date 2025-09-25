@@ -154,6 +154,7 @@ class IBApp(EWrapper, EClient):
         self.permId_to_orderId: Dict[int, int] = {}
         self.net_liquidation_value: float = 0.0
         self.what_if_result: Optional[dict] = None
+        self.what_if_event = threading.Event()
 
         # --- Data & Model Handlers ---
         self.data_manager = DataManager()
@@ -166,7 +167,7 @@ class IBApp(EWrapper, EClient):
         self.open_price_ticker_map: Dict[str, int] = {}
 
         # --- Asynchronous Request Management ---
-        self.historical_data_queue: queue.Queue = queue.Queue()
+        self.historical_data_results: Dict[int, dict] = {}
         self.active_requests: Dict[int, threading.Event] = {}
         self.active_contract_requests: Dict[int, dict] = {}
 
@@ -233,6 +234,7 @@ class IBApp(EWrapper, EClient):
                 'maintMargin': orderState.maintMarginChange,
                 'equityWithLoan': orderState.equityWithLoanChange,
             }
+            self.what_if_event.set()
         self.permId_to_orderId[order.permId] = orderId
 
     def openOrderEnd(self):
@@ -275,7 +277,7 @@ class IBApp(EWrapper, EClient):
             "Date": bar.date, "Open": bar.open, "High": bar.high,
             "Low": bar.low, "Close": bar.close, "Volume": bar.volume,
         }
-        self.historical_data_queue.put({'reqId': reqId, 'data': data})
+        self.historical_data_results[reqId] = data
 
     def historicalDataEnd(self, reqId: int, start: str, end: str):
         if reqId in self.active_requests:
@@ -462,17 +464,15 @@ class IBApp(EWrapper, EClient):
                 self.cancelHistoricalData(reqId)
                 failed_tickers["Timeout"].append(ticker)
 
+            if reqId in self.historical_data_results:
+                bars_to_update[ticker] = self.historical_data_results[reqId]
+                self.logger.info(f"Fetched daily bar for {ticker}")
+                del self.historical_data_results[reqId] # Clean up the consumed data
+            else:
+                # This can happen if historicalDataEnd arrives but historicalData didn't
+                self.logger.warning(f"No historical data bar found for {ticker} despite receiving completion signal.")
+                failed_tickers["No Data Bar"].append(ticker)
 
-            while not self.historical_data_queue.empty():
-                try:
-                    item = self.historical_data_queue.get_nowait()
-                    if item.get('reqId') == reqId:
-                        bars_to_update[ticker] = item['data']
-                        self.logger.info(f"Fetched daily bar for {ticker}")
-                        break
-                except queue.Empty:
-                    break
-            
             del self.active_requests[reqId]
             # PACING: Wait 11 seconds between historical data requests to stay well clear of the 
             # 60 requests per 10 minutes limit.
@@ -561,10 +561,10 @@ class IBApp(EWrapper, EClient):
         self.what_if_result = None
 
         what_if_id = self.get_next_order_id()
-        self.open_order_end_event.clear()
+        self.what_if_event.clear()
         self.placeOrder(what_if_id, contract, what_if_order)
 
-        if not self.open_order_end_event.wait(10):
+        if not self.what_if_event.wait(10):
             self.logger.error("Timeout on What-If check response.")
             return False
 
