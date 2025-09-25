@@ -46,6 +46,10 @@ MOC_SUBMISSION_WINDOW_MINUTES = 15
 # How many seconds to wait for opening prices after the market opens before giving up on a stock
 OPENING_PRICE_TIMEOUT_SECONDS = 90
 
+# --- ALGO PARAMETERS ---
+# Target percentage of the average closing auction volume for the 'ClosePrice' Algo
+# A value of 0.1 means the algo will target 10% of the closing volume.
+CLOSE_ALGO_TARGET_PERCENT_OF_VOLUME = 0.1
 
 # --- MODEL & FEATURE SPECIFICATIONS 🔬 ---
 # These settings must perfectly match the configuration used to train your model.
