@@ -21,6 +21,7 @@ from ibapi.contract import Contract
 from ibapi.order import Order
 from ibapi.common import TickerId, BarData
 from ibapi.contract import ContractDetails
+from ibapi.tag_value import TagValue
 
 import config
 from utils import setup_logging, get_lse_calendar, get_market_schedule_for_date
@@ -322,18 +323,32 @@ class IBApp(EWrapper, EClient):
         contract.primaryExchange = "LSE"
         return contract
 
-    def _create_order(self, action: str, quantity: float, order_type: str = "MKT") -> Order:
-        """Creates a basic Order object."""
+    def _create_order(self, action: str, quantity: float, order_type: str = "MIDPRICE") -> Order:
+        """Creates a basic Order object, defaulting to MidPrice for opening."""
         order = Order()
         order.action = action
         order.totalQuantity = quantity
         order.orderType = order_type
-        order.tif = "GTC" if order_type == "MOC" else "DAY"
-        # --- FIX for error 10268 ---
+        order.tif = "DAY"
         order.eTradeOnly = False
         order.firmQuoteOnly = False
         return order
 
+    def _create_closing_algo_order(self, action: str, quantity: float) -> Order:
+        """Creates a sophisticated IB Algo order to execute at the close."""
+        order = Order()
+        order.action = action
+        order.totalQuantity = quantity
+        order.orderType = "LMT"
+        order.lmtPrice = 0
+        order.tif = "DAY"
+        order.algoStrategy = "ClosePrice"
+        order.algoParams = []
+        order.algoParams.append(TagValue("target_percent", str(config.CLOSE_ALGO_TARGET_PERCENT_OF_VOLUME)))
+        
+        order.eTradeOnly = False
+        order.firmQuoteOnly = False
+        return order
 
     def connect_and_start(self):
         """Connects to IB Gateway and starts the message processing thread."""
@@ -623,25 +638,20 @@ class IBApp(EWrapper, EClient):
 
 
     def close_position(self, ticker: str, original_action: str, quantity: float):
-        """Places a Market-on-Close order to close the day's position with a fallback."""
+        """Places a 'ClosePrice' Algo order to close the day's position."""
         if quantity <= 0:
             self.logger.error("close_position called with non-positive quantity; aborting.")
             return
 
         closing_action = "SELL" if original_action == "BUY" else "BUY"
-        self.logger.info(f"Placing CLOSING MOC order for {quantity} {ticker}...")
+        self.logger.info(f"Placing CLOSING ALGO order for {quantity} {ticker}...")
 
         closing_contract = self._create_contract(ticker)
-        moc_order = self._create_order(closing_action, quantity, order_type="MOC")
-        moc_order_id = self.get_next_order_id()
-        self.placeOrder(moc_order_id, closing_contract, moc_order)
-
-        time.sleep(5)
-
-        if self.open_orders.get(moc_order_id, {}).get('status') == 'Cancelled':
-            self.logger.warning("MOC order was rejected/cancelled! Attempting fallback with MKT order.")
-            mkt_order = self._create_order(closing_action, quantity, order_type="MKT")
-            self.placeOrder(self.get_next_order_id(), closing_contract, mkt_order)
+        # Use the new algo order creation method
+        closing_order = self._create_closing_algo_order(closing_action, quantity)
+        
+        closing_order_id = self.get_next_order_id()
+        self.placeOrder(closing_order_id, closing_contract, closing_order)
 
     def request_opening_prices(self):
         """Requests snapshot of opening prices for all TRADABLE tickers."""
