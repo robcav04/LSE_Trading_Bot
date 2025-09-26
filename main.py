@@ -323,8 +323,8 @@ class IBApp(EWrapper, EClient):
         contract.primaryExchange = "LSE"
         return contract
 
-    def _create_order(self, action: str, quantity: float, order_type: str = "MIDPRICE") -> Order:
-        """Creates a basic Order object, defaulting to MidPrice for opening."""
+    def _create_order(self, action: str, quantity: float, order_type: str = "MKT") -> Order:
+        """Creates a basic Order object, defaulting to a Market order for opening."""
         order = Order()
         order.action = action
         order.totalQuantity = quantity
